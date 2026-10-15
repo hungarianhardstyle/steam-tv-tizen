@@ -1,0 +1,311 @@
+/*
+ *  _____  _   _  _____  _  _  _     
+ * |_   _|| | | |/  ___|| |(_)| |     Steam    
+ *   | |  | |_| |\ `--. | | _ | |__     In-Home
+ *   | |  |  _  | `--. \| || || '_ \      Streaming
+ *  _| |_ | | | |/\__/ /| || || |_) |       Library
+ *  \___/ \_| |_/\____/ |_||_||_.__/
+ *
+ * Copyright (c) 2022 Mariotaku <https://github.com/mariotaku>.
+ * 
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 3 of the License, or (at your option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ * 
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+#include "ihs_udp.h"
+#include "ihs_buffer.h"
+#include "ihs_thread.h"
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <fcntl.h>
+#include <errno.h>
+
+#ifdef __SWITCH__
+#include <switch.h>
+#else
+#include <ifaddrs.h>
+#include <net/if.h>
+#endif
+
+#include <assert.h>
+#include <stdatomic.h>
+
+#ifndef MSG_DONTWAIT
+#define MSG_DONTWAIT 0x40 /* Linux value; some platform headers omit it. */
+#endif
+
+struct IHS_UDPSocket {
+    int fd;
+    IHS_Mutex *mutex;
+    int sendFlags;
+    bool sendTimeoutArmed;
+    unsigned long sendFailures;
+};
+
+/* Every send that the kernel refused, process wide. A full send buffer must never park a caller:
+ * IHS_BaseSend holds the session lock across the send, and IHS_BaseLog used to take that same lock,
+ * so one blocked sendto silenced every thread in the client (measured 2026-10-14). Atomic because
+ * several threads send, and since the JavaScript watchdog reports it the app's main thread reads it
+ * too. */
+static atomic_ulong globalSendFailures;
+/* Set when a platform refused to arm the send timeout: the one backstop that works even if
+ * MSG_DONTWAIT is ignored, so its failure must be visible in the log rather than silent. */
+static atomic_bool globalSendTimeoutFailed;
+
+static void AddressFromSys(IHS_SocketAddress *ihs, const struct sockaddr_storage *sys);
+
+static size_t AddressToSys(const IHS_SocketAddress *ihs, struct sockaddr_storage *sys);
+
+IHS_UDPSocket *IHS_UDPSocketOpen(bool broadcast) {
+    IHS_UDPSocket *s = calloc(1, sizeof(IHS_UDPSocket));
+    s->sendFlags = MSG_DONTWAIT;
+    s->fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    assert(s->fd >= 0);
+    s->mutex = IHS_MutexCreate();
+    assert(s->mutex != NULL);
+    /* A 1440p keyframe arrives as a burst of hundreds of datagrams. The default
+     * receive buffer (~208 KiB) overflows mid-frame and the kernel drops the
+     * remainder, so frames never reassemble. SO_RCVBUF is clamped to
+     * net.core.rmem_max; SO_RCVBUFFORCE ignores the clamp but needs CAP_NET_ADMIN. */
+    int rcvbuf = 4 * 1024 * 1024;
+#ifdef SO_RCVBUFFORCE
+    if (setsockopt(s->fd, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf)) != 0) {
+        setsockopt(s->fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    }
+#else
+    setsockopt(s->fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+#endif
+    int actual = 0;
+    socklen_t actualLen = sizeof(actual);
+    if (getsockopt(s->fd, SOL_SOCKET, SO_RCVBUF, &actual, &actualLen) == 0 && actual < rcvbuf) {
+        fprintf(stderr, "IHS_UDPSocketOpen: SO_RCVBUF capped at %d bytes (wanted %d); "
+                        "raise net.core.rmem_max to avoid dropped video packets\n", actual, rcvbuf);
+    }
+    if (broadcast) {
+        uint32_t opt = 1;
+        setsockopt(s->fd, SOL_SOCKET, SO_BROADCAST, (char *) &opt, sizeof(opt));
+    }
+    /* Sends are unreliable by design (the protocol retransmits what matters), so a full send buffer
+     * must drop instead of blocking: a blocking sendto holds the session lock and, through
+     * IHS_BaseLog, freezes every thread of the client. MSG_DONTWAIT on the send plus an explicit
+     * send timeout covers platforms whose socket bindings ignore the flag. */
+    int sndbuf = 1024 * 1024;
+    setsockopt(s->fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    struct timeval sendTimeout;
+    sendTimeout.tv_sec = 0;
+    sendTimeout.tv_usec = 50000;
+    s->sendTimeoutArmed = setsockopt(s->fd, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, sizeof(sendTimeout)) == 0;
+    if (!s->sendTimeoutArmed) {
+        /* MSG_DONTWAIT alone is not a guarantee on a platform binding that ignores socket flags, and
+         * this is the only other bound on how long a full send buffer can hold the session lock. */
+        atomic_store_explicit(&globalSendTimeoutFailed, true, memory_order_relaxed);
+        fprintf(stderr, "IHS_UDPSocketOpen: SO_SNDTIMEO could not be set; a full send buffer can "
+                        "block a send (and the session lock) despite MSG_DONTWAIT\n");
+    }
+    return s;
+}
+
+void IHS_UDPSocketClose(IHS_UDPSocket *s) {
+    IHS_MutexDestroy(s->mutex);
+    close(s->fd);
+    free(s);
+}
+
+int IHS_UDPSocketReceive(IHS_UDPSocket *s, IHS_UDPPacket *packet) {
+    struct sockaddr_storage sender;
+    socklen_t senderlen = sizeof(sender);
+    ssize_t len;
+    IHS_BufferEnsureMaxSize(&packet->buffer, 2048);
+    if ((len = recvfrom(s->fd, IHS_BufferPointer(&packet->buffer), IHS_BufferMaxSize(&packet->buffer),
+                        0, (struct sockaddr *) &sender, &senderlen)) <= 0) {
+        if (len == 0) return 0; /* empty datagram, nothing to deliver */
+        switch (errno) {
+            case EAGAIN:
+#if EWOULDBLOCK != EAGAIN
+            case EWOULDBLOCK:
+#endif
+            case ETIMEDOUT:  /* recv timeout tick */
+            case EINTR:
+            /* Stray ICMP errors from a prior unicast send (e.g. the host's
+             * ephemeral broadcast port is closed) surface on the next recv.
+             * Steam's client ignores these; tearing down the worker here would
+             * abort authorization/streaming handshakes. */
+            case ECONNREFUSED:
+            case ECONNRESET:
+            case ENETUNREACH:
+            case EHOSTUNREACH:
+                return 0;
+            default:
+                fprintf(stderr, "IHS_UDPSocketReceive: fatal recvfrom errno=%d (%s)\n",
+                        errno, strerror(errno));
+                return -1;
+        }
+    }
+    packet->buffer.size = len;
+    AddressFromSys(&packet->address, &sender);
+    return 1;
+}
+
+bool IHS_UDPSocketSend(IHS_UDPSocket *s, const IHS_UDPPacket *packet) {
+    struct sockaddr_storage addr;
+    size_t addr_len = AddressToSys(&packet->address, &addr);
+    IHS_MutexLock(s->mutex);
+    ssize_t sent = sendto(s->fd, IHS_BufferPointer(&packet->buffer), packet->buffer.size,
+                          s->sendFlags, (struct sockaddr *) &addr, addr_len);
+    if (sent < 0 && s->sendFlags != 0 && (errno == EINVAL || errno == ENOTSUP)) {
+        /* A platform binding that validates the flag word rejects MSG_DONTWAIT outright; fall back to
+         * the plain call, where the SO_SNDTIMEO set at open keeps the hold time bounded. Report it:
+         * silently sending blocking again is how the client froze before. */
+        fprintf(stderr, "IHS_UDPSocketSend: MSG_DONTWAIT rejected (errno=%d); falling back to a "
+                        "blocking send%s\n", errno, s->sendTimeoutArmed ? " with a 50 ms timeout" : " WITHOUT a timeout");
+        s->sendFlags = 0;
+        sent = sendto(s->fd, IHS_BufferPointer(&packet->buffer), packet->buffer.size, 0,
+                      (struct sockaddr *) &addr, addr_len);
+    }
+    if (sent < 0) {
+        s->sendFailures++;
+        atomic_fetch_add_explicit(&globalSendFailures, 1, memory_order_relaxed);
+    }
+    IHS_MutexUnlock(s->mutex);
+    return sent > 0;
+}
+
+unsigned long IHS_UDPSocketSendFailures(IHS_UDPSocket *s) {
+    return s ? s->sendFailures : 0;
+}
+
+unsigned long IHS_UDPSocketSendFailuresGlobal(void) {
+    return atomic_load_explicit(&globalSendFailures, memory_order_relaxed);
+}
+
+bool IHS_UDPSocketSendTimeoutArmed(void) {
+    return !atomic_load_explicit(&globalSendTimeoutFailed, memory_order_relaxed);
+}
+
+bool IHS_UDPSocketSetBlocking(IHS_UDPSocket *s, bool blocking) {
+#ifdef __EMSCRIPTEN__
+    // Tizen sockets start blocking and do not support fcntl(F_SETFL).
+    return blocking;
+#else
+    return fcntl(s->fd, F_SETFL, blocking ? 0 : O_NONBLOCK) == 0;
+#endif
+}
+
+bool IHS_UDPSocketSetRecvTimeout(IHS_UDPSocket *s, uint32_t timeoutUs) {
+    struct timeval tv;
+    tv.tv_sec = (int32_t) (timeoutUs / 1000000);
+    tv.tv_usec = (int32_t) (timeoutUs % 1000000);
+    return setsockopt(s->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0;
+}
+
+static void AddressFromSys(IHS_SocketAddress *ihs, const struct sockaddr_storage *sys) {
+    switch (sys->ss_family) {
+        case AF_INET: {
+            ihs->ip.family = IHS_IPAddressFamilyIPv4;
+            const struct sockaddr_in *addr = (const struct sockaddr_in *) sys;
+            memcpy(&ihs->ip.v4.data, &addr->sin_addr, 4);
+            ihs->port = ntohs(addr->sin_port);
+            break;
+        }
+        case AF_INET6: {
+            ihs->ip.family = IHS_IPAddressFamilyIPv6;
+            const struct sockaddr_in6 *addr = (const struct sockaddr_in6 *) sys;
+            memcpy(&ihs->ip.v6.data, &addr->sin6_addr, 16);
+            ihs->port = ntohs(addr->sin6_port);
+            break;
+        }
+        default: {
+            assert(sys->ss_family == AF_INET || sys->ss_family == AF_INET6);
+            break;
+        }
+    }
+}
+
+static size_t AddressToSys(const IHS_SocketAddress *ihs, struct sockaddr_storage *sys) {
+    switch (ihs->ip.family) {
+        case IHS_IPAddressFamilyIPv4: {
+            struct sockaddr_in *addr = (struct sockaddr_in *) sys;
+            memset(addr, 0, sizeof(struct sockaddr_in));
+            addr->sin_family = AF_INET;
+            addr->sin_port = htons(ihs->port);
+            memcpy(&addr->sin_addr, ihs->ip.v4.data, 4);
+            return sizeof(*addr);
+        }
+        case IHS_IPAddressFamilyIPv6: {
+            struct sockaddr_in6 *addr = (struct sockaddr_in6 *) sys;
+            memset(addr, 0, sizeof(struct sockaddr_in6));
+            addr->sin6_family = AF_INET6;
+            addr->sin6_port = htons(ihs->port);
+            memcpy(&addr->sin6_addr, ihs->ip.v6.data, 16);
+            return sizeof(*addr);
+        }
+        default: {
+            assert(ihs->ip.family == IHS_IPAddressFamilyIPv4 || ihs->ip.family == IHS_IPAddressFamilyIPv6);
+            return -1;
+        }
+    }
+}
+
+static size_t AddBroadcastAddress(IHS_IPAddress *out, size_t n, size_t max, uint32_t addressNetOrder) {
+    if (n >= max || addressNetOrder == 0 || addressNetOrder == 0xFFFFFFFFu) {
+        return n;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (memcmp(out[i].v4.data, &addressNetOrder, 4) == 0) {
+            return n;
+        }
+    }
+    out[n].v4.family = IHS_IPAddressFamilyIPv4;
+    memcpy(out[n].v4.data, &addressNetOrder, 4);
+    return n + 1;
+}
+
+size_t IHS_UDPBroadcastAddresses(IHS_IPAddress *out, size_t max) {
+    size_t n = 0;
+#ifdef __SWITCH__
+    /* No getifaddrs() on Horizon; nifm knows the current connection. nifm's
+     * service is reference counted, so this doesn't disturb the application. */
+    if (max == 0 || R_FAILED(nifmInitialize(NifmServiceType_User))) {
+        return 0;
+    }
+    u32 address = 0, mask = 0, gateway = 0, dns1 = 0, dns2 = 0;
+    if (R_SUCCEEDED(nifmGetCurrentIpConfigInfo(&address, &mask, &gateway, &dns1, &dns2)) &&
+        address != 0) {
+        /* Both in network byte order. */
+        n = AddBroadcastAddress(out, n, max, address | ~mask);
+    }
+    nifmExit();
+#else
+    struct ifaddrs *list = NULL;
+    if (getifaddrs(&list) != 0) {
+        return 0;
+    }
+    for (struct ifaddrs *ifa = list; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET ||
+            !(ifa->ifa_flags & IFF_UP) || !(ifa->ifa_flags & IFF_BROADCAST) ||
+            ifa->ifa_broadaddr == NULL) {
+            continue;
+        }
+        n = AddBroadcastAddress(out, n, max, ((const struct sockaddr_in *) ifa->ifa_broadaddr)->sin_addr.s_addr);
+    }
+    freeifaddrs(list);
+#endif
+    return n;
+}

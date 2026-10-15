@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<widget xmlns="http://www.w3.org/ns/widgets" xmlns:tizen="http://tizen.org/ns/widgets" id="https://local.steamtv/probe" version="0.1.0" viewmodes="maximized">
+  <tizen:application id="SteamTV001.Probe" package="SteamTV001" required_version="6.5"/>
+  <name>Steam TV</name>
+  <icon src="icon.png"/>
+  <content src="index.html"/>
+  <tizen:profile name="tv-samsung"/>
+  <tizen:privilege name="http://tizen.org/privilege/internet"/>
+  <tizen:privilege name="http://tizen.org/privilege/fullscreen"/>
+  <tizen:metadata key="http://samsung.com/tv/metadata/use.game.mode" value="true"/>
+  <tizen:setting screen-orientation="landscape" context-menu="disable" background-support="disable" encryption="disable" install-location="auto" hwkey-event="enable"/>
+  <access origin="*" subdomains="true"/>
+</widget>

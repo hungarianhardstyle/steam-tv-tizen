@@ -1,0 +1,384 @@
+/*
+ *  _____  _   _  _____  _  _  _
+ * |_   _|| | | |/  ___|| |(_)| |     Steam
+ *   | |  | |_| |\ `--. | | _ | |__     In-Home
+ *   | |  |  _  | `--. \| || || '_ \      Streaming
+ *  _| |_ | | | |/\__/ /| || || |_) |       Library
+ *  \___/ \_| |_/\____/ |_||_||_.__/
+ *
+ * Copyright (c) 2022 Mariotaku <https://github.com/mariotaku>.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 3 of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+
+#include "client_pri.h"
+#include "crypto.h"
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct IHS_StreamingState {
+    IHS_Client *client;
+    IHS_HostInfo host;
+    IHS_StreamingRequest request;
+    uint32_t requestId;
+    ERemoteClientBroadcastMsg lastMsgType;
+    uint64_t lastMsgTime;
+    bool terminal;
+} IHS_StreamingState;
+
+static uint64_t StreamingRequestTimer(int runCount, void *context);
+
+static void StreamingRequestCleanup(void *context);
+
+static void SendCancel(IHS_Client *client, const IHS_HostInfo *host, uint32_t id) {
+    CMsgRemoteDeviceStreamingCancelRequest msg = CMSG_REMOTE_DEVICE_STREAMING_CANCEL_REQUEST__INIT;
+    msg.request_id = id;
+    IHS_ClientSend(client, host->address, k_ERemoteDeviceStreamingCancelRequest, (ProtobufCMessage *)&msg);
+}
+static void CancelVisit(IHS_TimerTask *task, void *context) {
+    IHS_UNUSED(task);
+    IHS_Client *client = context;
+    IHS_TimerTaskStopOwned(client->timers, &client->taskHandles.streaming);
+}
+bool IHS_ClientStreamingCancel(IHS_Client *client) {
+    /* Visit locks out callbacks/retries before retiring the transaction. */
+    IHS_TimerTaskVisitOwned(client->timers, &client->taskHandles.streaming, CancelVisit, client);
+    IHS_BaseLock(&client->base);
+    uint32_t id = client->lastLaunchId;
+    IHS_HostInfo host = client->lastLaunchHost;
+    if (id) {
+        unsigned i = client->canceledNext++ % 8;
+        client->canceled[i].host = host;
+        client->canceled[i].requestId = id;
+        client->canceled[i].until = IHS_TimerNow() + 60000;
+        client->canceled[i].lastCancel = IHS_TimerNow();
+        client->lastLaunchId = 0;
+    }
+    IHS_BaseUnlock(&client->base);
+    if (id) SendCancel(client, &host, id);
+    return id != 0;
+}
+
+bool IHS_ClientStreamingRequest(IHS_Client *client, const IHS_HostInfo *host,
+                                const IHS_StreamingRequest *request) {
+    IHS_ClientLog(client, IHS_LogLevelInfo, "Client", "Begin sending streaming request to host %s",
+                  host->hostname);
+    IHS_StreamingState *state = malloc(sizeof(IHS_StreamingState));
+    if (!state)
+        return false;
+    state->terminal = false;
+    state->client = client;
+    state->host = *host;
+    state->request = *request;
+    IHS_ClientStreamingCancel(client);
+    bool collision;
+    do {
+        state->requestId = IHS_CryptoRandomUInt32();
+        collision = !state->requestId;
+        IHS_BaseLock(&client->base);
+        for (unsigned i = 0; i < 8; ++i)
+            collision |= client->canceled[i].requestId == state->requestId;
+        IHS_BaseUnlock(&client->base);
+    } while (collision);
+    IHS_BaseLock(&client->base);
+    client->lastLaunchId = state->requestId;
+    client->lastLaunchHost = *host;
+    IHS_BaseUnlock(&client->base);
+    state->lastMsgType = k_ERemoteClientBroadcastMsgDiscovery;
+    state->lastMsgTime = IHS_TimerNow();
+    if (!IHS_TimerTaskStartOwned(client->timers, &client->taskHandles.streaming,
+                                 StreamingRequestTimer, StreamingRequestCleanup, 25, state)) {
+        free(state);
+        return false;
+    }
+    return true;
+}
+
+typedef struct {
+    IHS_Client *client;
+    CMsgRemoteClientBroadcastHeader *header;
+    ProtobufCMessage *message;
+    const IHS_SocketAddress *address;
+} StreamingResponseContext;
+
+static void StreamingResponseVisit(IHS_TimerTask *timer, void *context) {
+    StreamingResponseContext *responseContext = context;
+    IHS_Client *client = responseContext->client;
+    CMsgRemoteClientBroadcastHeader *header = responseContext->header;
+    ProtobufCMessage *message = responseContext->message;
+    IHS_StreamingState *state = IHS_TimerTaskGetContext(timer);
+    if (state->terminal || !IHS_ClientMatchesHost(&state->host, responseContext->address, header)) return;
+    uint32_t id;
+    switch (header->msg_type) {
+    case k_ERemoteDeviceProofRequest: {
+        CMsgRemoteDeviceProofRequest *proof = (void *)message;
+        id = proof->has_request_id ? proof->request_id : state->requestId;
+        break;
+    }
+    case k_ERemoteDeviceStreamingResponse: id = ((CMsgRemoteDeviceStreamingResponse *)message)->request_id; break;
+    case k_ERemoteDeviceStreamingProgress: id = ((CMsgRemoteDeviceStreamingProgress *)message)->request_id; break;
+    default: return;
+    }
+    if (id != state->requestId) return;
+    state->lastMsgType = header->msg_type;
+    state->lastMsgTime = IHS_TimerNow();
+    switch (header->msg_type) {
+    case k_ERemoteDeviceProofRequest: {
+        CMsgRemoteDeviceProofRequest *request = (CMsgRemoteDeviceProofRequest *)message;
+        CMsgRemoteDeviceProofResponse response = CMSG_REMOTE_DEVICE_PROOF_RESPONSE__INIT;
+        response.has_request_id = request->has_request_id;
+        /* The caller selects the host's negotiated secret or its legacy installation
+         * secret before streaming. Rotation is not implemented: acknowledge only
+         * proof, without claiming to have persisted a replacement host secret. */
+        response.has_updated_secret = true;
+        response.updated_secret = false;
+        response.request_id = request->request_id;
+
+        uint8_t encrypted[1024];
+        response.response.data = encrypted;
+        response.response.len = sizeof(encrypted);
+        int encryptRet = IHS_CryptoSymmetricEncrypt(
+            request->challenge.data, request->challenge.len, client->base.secretKey,
+            sizeof(client->base.secretKey), response.response.data, &response.response.len);
+        if (encryptRet != 0) {
+            // Mirrors CServerManager::HandleStreamingProofRequest (0x1e1ad0):
+            // log and drop, let the server retry / time out. Sending the response
+            // anyway would ship uninitialized stack bytes that the server would
+            // reject as a bad HMAC — same observable outcome, but with no client
+            // log trail for a real crypto regression.
+            IHS_ClientLog(client, IHS_LogLevelWarn, "Client",
+                          "Proof challenge encrypt failed for host %s: %d", state->host.hostname,
+                          encryptRet);
+            break;
+        }
+
+        IHS_ClientSend(client, state->host.address, k_ERemoteDeviceProofResponse,
+                       (ProtobufCMessage *)&response);
+        break;
+    }
+    case k_ERemoteDeviceStreamingProgress:
+        if (client->callbacks.streaming && client->callbacks.streaming->progress)
+            client->callbacks.streaming->progress(client, &state->host, client->callbackContexts.streaming);
+        break;
+    case k_ERemoteDeviceStreamingResponse: {
+        CMsgRemoteDeviceStreamingResponse *response = (CMsgRemoteDeviceStreamingResponse *)message;
+        if (response->request_id != state->requestId)
+            return;
+        switch (response->result) {
+        case k_ERemoteDeviceStreamingInProgress:
+            IHS_ClientLog(client, IHS_LogLevelDebug, "Client",
+                          "Streaming request in progress: host %s", state->host.hostname);
+            if (client->callbacks.streaming && client->callbacks.streaming->progress) {
+                client->callbacks.streaming->progress(client, &state->host,
+                                                      client->callbackContexts.streaming);
+            }
+            return;
+        case k_ERemoteDeviceStreamingSuccess:
+            state->terminal = true;
+            IHS_ClientLog(client, IHS_LogLevelDebug, "Client",
+                          "Streaming request succeeded: host %s", state->host.hostname);
+            if (client->callbacks.streaming && client->callbacks.streaming->success) {
+                ProtobufCBinaryData enc = response->encrypted_session_key;
+                uint8_t key[128];
+                size_t keyLen = sizeof(key);
+                int decryptRet =
+                    IHS_CryptoSymmetricDecrypt(enc.data, enc.len, client->base.secretKey,
+                                               sizeof(client->base.secretKey), key, &keyLen);
+                if (decryptRet != 0) {
+                    // Same class of bug as the proof-request encrypt path. Without this
+                    // check we'd hand the app an uninitialized 128-byte stack buffer as
+                    // the session key — downstream video/audio decode would fail with a
+                    // cryptic error far from the actual cause.
+                    IHS_ClientLog(client, IHS_LogLevelWarn, "Client",
+                                  "Session key decrypt failed for host %s: %d",
+                                  state->host.hostname, decryptRet);
+                } else {
+                    IHS_SocketAddress streamingAddress = {state->host.address.ip, response->port};
+                    client->callbacks.streaming->success(client, &state->host, &streamingAddress,
+                                                         key, keyLen,
+                                                         client->callbackContexts.streaming);
+                }
+            }
+            break;
+        default:
+            state->terminal = true;
+            IHS_ClientLog(client, IHS_LogLevelWarn, "Client", "Streaming request failed: host %s",
+                          state->host.hostname);
+            if (client->callbacks.streaming && client->callbacks.streaming->failed) {
+                IHS_StreamingResult result = (IHS_StreamingResult)response->result;
+                client->callbacks.streaming->failed(client, &state->host, result,
+                                                    client->callbackContexts.streaming);
+            }
+            break;
+        }
+        IHS_TimerTaskStop(timer);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void IHS_ClientStreamingCallback(IHS_Client *client, const IHS_SocketAddress *address,
+                                 CMsgRemoteClientBroadcastHeader *header,
+                                 ProtobufCMessage *message) {
+    if (header->msg_type == k_ERemoteDeviceStreamingResponse) {
+        CMsgRemoteDeviceStreamingResponse *resp = (void *)message;
+        IHS_HostInfo oldHost;
+        bool resend = false;
+        uint64_t now = IHS_TimerNow();
+        IHS_BaseLock(&client->base);
+        for (unsigned i = 0; i < 8; ++i) {
+            if (client->canceled[i].requestId == resp->request_id &&
+                client->canceled[i].until > now &&
+                IHS_ClientMatchesHost(&client->canceled[i].host, address, header)) {
+                if (resp->result == k_ERemoteDeviceStreamingInProgress &&
+                    now - client->canceled[i].lastCancel >= 250) {
+                    oldHost = client->canceled[i].host;
+                    client->canceled[i].lastCancel = now;
+                    resend = true;
+                }
+                IHS_BaseUnlock(&client->base);
+                if (resend) SendCancel(client, &oldHost, resp->request_id);
+                return;
+            }
+        }
+        IHS_BaseUnlock(&client->base);
+    }
+    StreamingResponseContext context = {client, header, message, address};
+    IHS_TimerTaskVisitOwned(client->timers, &client->taskHandles.streaming, StreamingResponseVisit,
+                            &context);
+}
+
+static uint64_t StreamingRequestTimer(int runCount, void *context) {
+    (void)runCount;
+    IHS_StreamingState *state = context;
+    IHS_Client *client = state->client;
+    if ((IHS_TimerNow() - state->lastMsgTime) > 15000) {
+        IHS_ClientLog(client, IHS_LogLevelWarn, "Client", "Streaming request timed out: host %s",
+                      state->host.hostname);
+        if (client->callbacks.streaming && client->callbacks.streaming->failed) {
+            client->callbacks.streaming->failed(client, &state->host, IHS_StreamingTimeout,
+                                                client->callbackContexts.streaming);
+        }
+        return 0;
+    }
+    IHS_HostInfo host = state->host;
+    IHS_StreamingRequest request = state->request;
+
+    CMsgRemoteDeviceStreamingRequest message = CMSG_REMOTE_DEVICE_STREAMING_REQUEST__INIT;
+    message.request_id = state->requestId;
+
+    message.has_client_id = true;
+    message.client_id = host.clientId;
+
+    message.has_pin = true;
+    message.pin.len = strnlen(request.pin, sizeof(request.pin));
+    message.pin.data = (uint8_t *)request.pin;
+
+    message.has_maximum_resolution_x = request.maxResolution.x > 0;
+    message.maximum_resolution_x = request.maxResolution.x;
+    message.has_maximum_resolution_y = request.maxResolution.y > 0;
+    message.maximum_resolution_y = request.maxResolution.y;
+
+    /* The host derives its capture frame rate from these two fields. Omitting them made it log
+     * "Maximum capture: 1920x1080 -nan(ind) FPS" and never start the video stream, while audio
+     * started normally. Default to 60/1 so every caller gets a usable frame rate. */
+    message.has_maximum_framerate_numerator = true;
+    message.maximum_framerate_numerator =
+            request.maxFramerate.numerator > 0 ? request.maxFramerate.numerator : 60;
+    message.has_maximum_framerate_denominator = true;
+    message.maximum_framerate_denominator =
+            request.maxFramerate.denominator > 0 ? request.maxFramerate.denominator : 1;
+
+    message.has_enable_audio_streaming = true;
+    message.enable_audio_streaming = request.streamingEnable.audio;
+
+    message.has_enable_video_streaming = true;
+    message.enable_video_streaming = request.streamingEnable.video;
+
+    message.has_enable_input_streaming = true;
+    message.enable_input_streaming = request.streamingEnable.input;
+
+    message.has_audio_channel_count = true;
+    message.audio_channel_count = request.audioChannelCount;
+
+    message.has_restricted = true;
+    message.restricted = false;
+
+    message.has_stream_interface = true;
+    message.stream_interface = (EStreamInterface)request.streamingInterface;
+
+    message.has_stream_desktop = true;
+    message.stream_desktop = request.streamDesktop;
+    if (request.gameId != 0) {
+        message.has_gameid = true;
+        message.gameid = request.gameId;
+    }
+
+    message.has_form_factor = true;
+    message.form_factor = k_EStreamDeviceFormFactorTV;
+
+    /* Without a device_version the host ignores maximum_resolution_x/y and streams
+     * at its own capture size. It does NOT gate the advertised codec list on this,
+     * nor on anything else in this message: CMsgRemoteDeviceStreamingRequest has no
+     * codec field at all. The host offers what its encoder can produce. */
+    message.device_version = "1.1.0";
+
+    message.has_device_token = true;
+    message.device_token.data = client->base.deviceToken;
+    message.device_token.len = sizeof(client->base.deviceToken);
+
+    message.n_supported_transport = 1;
+    EStreamTransport transports[] = {k_EStreamTransportUDP};
+    message.supported_transport = transports;
+
+    /* Reserve gamepad slots the way Steam does: the host sets them up from the
+     * request rather than waiting for the HID channel to enumerate mid-stream.
+     * controller_type is left unset so the host still types each pad from its
+     * HID vid:pid. Steam sends both the count and one entry per slot. */
+    CMsgRemoteDeviceStreamingRequest__ReservedGamepad reserved[16];
+    CMsgRemoteDeviceStreamingRequest__ReservedGamepad *reservedPtrs[16];
+    int gamepadCount = request.gamepadCount;
+    if (gamepadCount > 16)
+        gamepadCount = 16;
+    if (gamepadCount > 0) {
+        message.has_gamepad_count = true;
+        message.gamepad_count = gamepadCount;
+        for (int i = 0; i < gamepadCount; i++) {
+            cmsg_remote_device_streaming_request__reserved_gamepad__init(&reserved[i]);
+            reservedPtrs[i] = &reserved[i];
+        }
+        message.n_gamepads = gamepadCount;
+        message.gamepads = reservedPtrs;
+    }
+
+    IHS_ClientLog(client, IHS_LogLevelDebug, "Client",
+                  "Sending streaming request packet to host %s", host.hostname);
+    IHS_ClientSend(client, host.address, k_ERemoteDeviceStreamingRequest,
+                   (ProtobufCMessage *)&message);
+    return 3000;
+}
+
+static void StreamingRequestCleanup(void *context) {
+    free(context);
+}
+
+void IHS_ClientStreamingEstablished(IHS_Client *client) {
+    IHS_TimerTaskStopOwned(client->timers, &client->taskHandles.streaming);
+    IHS_BaseLock(&client->base);
+    client->lastLaunchId = 0;
+    IHS_BaseUnlock(&client->base);
+}

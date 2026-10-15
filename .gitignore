@@ -1,0 +1,26 @@
+# Build outputs (produced by work/build-probe.ps1)
+work/steam-tv/ihs.js
+work/steam-tv/ihs.wasm
+work/steam-tv/ihs.js.mem
+work/steam-tv/ihs.worker.js
+work/ihs-core.bc
+work/opus.bc
+work/test-native.js
+work/test-native.wasm
+work/test-native.js.mem
+work/test-native.worker.js
+work/test-decoder*
+
+# The Samsung Emscripten SDK is downloaded separately (1.6 GB, not part of this repo)
+work/samsung-emscripten/
+
+# Installer build output
+work/tv-device/bin/
+work/tv-device/obj/
+
+# Local logs, backups, editor/OS noise
+*.log
+work/SteamTV-before-*.wgt
+work/SteamTVProbe.wgt
+.DS_Store
+Thumbs.db

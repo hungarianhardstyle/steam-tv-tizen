@@ -1,0 +1,435 @@
+import vm from 'node:vm';
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { webcrypto } from 'node:crypto';
+const elements = new Map();
+const storage = new Map();
+const handlers = new Map();
+const focused = { current: null };
+let playingClass = false;
+const bodyClasses = new Set();
+const context = vm.createContext({ document: { get activeElement() { return focused.current; }, getElementById: id => {
+  if (!elements.has(id)) elements.set(id, { id, tagName: 'BUTTON', textContent: '', disabled: true, hidden: false, focus() { focused.current = this; } });
+  return elements.get(id);
+}, body: { classList: { add(name) { bodyClasses.add(name); playingClass = bodyClasses.has('playing'); }, remove(name) { bodyClasses.delete(name); playingClass = bodyClasses.has('playing'); } } }, addEventListener(name, handler) { handlers.set(name, handler); } }, crypto: webcrypto, console, window: {}, localStorage: {
+  getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key)
+}, Uint8Array, Uint32Array });
+vm.runInContext(await readFile(new URL('./app.js', import.meta.url), 'utf8'), context);
+const realHtml = await readFile(new URL('./index.html', import.meta.url), 'utf8');
+assert.match(realHtml, /<div\s+id="panel">\s*<p\s+id="status"\s+role="status">[^<]*<\/p>\s*<div\s+class="card">/,
+  'status must be a direct panel child, outside the settings card hidden by streaming CSS');
+assert.equal((realHtml.match(/id="status"/g) || []).length, 1);
+assert.match(realHtml, /\.preparing #panel>:not\(#status\),\.playing #panel>:not\(#status\)\{display:none\}/);
+context.Module.HEAPU8 = new Uint8Array(1024);
+// Browser callbacks can be skipped while frames are presented; use the platform's cumulative count.
+let frameTick;
+context.setInterval = () => 1;
+context.document.getElementById('video');
+elements.get('video').requestVideoFrameCallback = callback => { frameTick = callback; };
+context.TVLink.startVideoClock();
+frameTick(0, { presentedFrames: 10 });
+frameTick(1, { presentedFrames: 14 });
+assert.equal(context.TVLink.presented, 14, 'skipped callbacks must not undercount presented frames');
+frameTick(2, { presentedFrames: 1 });
+assert.equal(context.TVLink.presented, 15, 'a new stream resetting its frame count must remain cumulative');
+delete context.setInterval;
+delete elements.get('video').requestVideoFrameCallback;
+// Presentation timing is measured from frame metadata, not the 250 ms clock mirror.
+context.TVLink.playing();
+context.TVLink.lastPresentedTotal = null;
+context.TVLink.presented = 0;
+for (let i = 0; i <= 120; i++) context.TVLink.observeVideoFrame(1000 + i * 1000 / 60, {
+  presentedFrames: i + 1, presentationTime: 1000 + i * 1000 / 60,
+  expectedDisplayTime: 1001 + i * 1000 / 60, processingDuration: 0.004
+});
+elements.get('video').getVideoPlaybackQuality = () => ({ droppedVideoFrames: 3 });
+let presentationReport = context.TVLink.reportPresentation(3000);
+assert.match(presentationReport, /fps=60\.0 interval=16\.7\/16\.7\/16\.7ms decode=4\.0\/4\.0\/4\.0ms/);
+assert.match(presentationReport, /JS-late=0\.0\/0\.0\/0\.0ms coalesced=0 dropAPI=3 raf~NAHz panel=NA/);
+assert.match(presentationReport, /jitter=0\.0ms media=NA/);
+assert.equal(context.TVLink.frameStats.intervals.length, 0, 'each report must drain its bounded timing window');
+context.TVLink.observeVideoFrame(3050, { presentedFrames: 124, presentationTime: 3050 });
+assert.equal(context.TVLink.frameStats.coalesced, 2);
+assert.equal(context.TVLink.frameStats.intervals.length, 0, 'coalesced callbacks must not invent per-frame jitter');
+const beforeCounterReset = context.TVLink.presented;
+context.TVLink.playing();
+context.TVLink.observeVideoFrame(3066, { presentedFrames: 125, presentationTime: 3066 });
+assert.equal(context.TVLink.presented, beforeCounterReset + 1, 'UI state changes must not recount all presented frames');
+delete elements.get('video').getVideoPlaybackQuality;
+context.TVLink.observeVideoFrame(3083, { presentedFrames: 1, presentationTime: 3083 });
+assert.equal(context.TVLink.presented, beforeCounterReset + 2, 'a new platform counter must not underflow');
+for (let i = 0; i < 500; i++) context.TVLink.observeVideoFrame(3100 + i * 17, { presentedFrames: i + 2, presentationTime: 3100 + i * 17 });
+assert.equal(context.TVLink.frameStats.intervals.length, 240, 'a stalled reporter must keep bounded storage');
+presentationReport = context.TVLink.reportPresentation(12000);
+assert.match(presentationReport, /decode=NAms/);
+assert.match(presentationReport, /dropAPI=NA/);
+elements.get('diagnostics').onclick();
+assert.equal(bodyClasses.has('diagnostics'), true);
+elements.get('diagnostics').onclick();
+assert.equal(bodyClasses.has('diagnostics'), false);
+let displayTick, displayRequests = 0;
+context.requestAnimationFrame = callback => { displayTick = callback; displayRequests++; };
+context.TVLink.sampleDisplayClock();
+for (let i = 0; i <= 120; i++) displayTick(i * 20);
+assert.equal(context.TVLink.displayHzEstimate, 50, 'measure the observed compositor cadence instead of assuming 60 Hz');
+assert.equal(context.TVLink.frameRate, 60, 'display diagnostics must not change the requested stream FPS');
+assert.equal(displayRequests, 121, 'display sampling must stop after its finite measurement window');
+context.TVLink.sampleDisplayClock();
+context.TVLink.failed('timing test done');
+const requestsBeforeCancellation = displayRequests;
+displayTick(3000);
+assert.equal(displayRequests, requestsBeforeCancellation, 'a stopped stream must cancel display sampling');
+delete context.requestAnimationFrame;
+assert.equal(context.TVLink.identity(100), 1);
+const first = context.Module.HEAPU8.slice(100, 140);
+assert.equal(context.TVLink.identity(200), 1);
+assert.deepEqual(context.Module.HEAPU8.slice(200, 240), first);
+const originalId = storage.get('steam-tv-identity').slice(0, 16);
+context.Module.HEAPU8.fill(0xA5, 500, 532);
+context.TVLink.saveSecret(500);
+assert.equal(storage.get('steam-tv-identity').slice(0, 16), originalId);
+assert.equal(storage.get('steam-tv-identity').slice(16), 'a5'.repeat(32));
+assert.equal(storage.get('steam-tv-paired'), '1');
+storage.delete('steam-tv-paired');
+assert.equal(context.TVLink.identity(600), 1);
+assert.deepEqual(context.Module.HEAPU8.slice(608, 640), new Uint8Array(32).fill(0xA5));
+const beforeCorruption = storage.get('steam-tv-identity');
+storage.set('steam-tv-identity', 'corrupt');
+storage.set('steam-tv-paired', '1');
+assert.equal(context.TVLink.identity(300), 1);
+assert.equal(storage.get('steam-tv-identity'), beforeCorruption, 'a damaged primary copy must be repaired from the backup');
+assert.equal(storage.get('steam-tv-paired'), '1', 'a repairable identity must keep the pairing');
+assert.deepEqual(context.Module.HEAPU8.slice(300, 340), new Uint8Array(beforeCorruption.match(/../g).map(value => parseInt(value, 16))));
+storage.set('steam-tv-identity', 'corrupt');
+storage.set('steam-tv-identity-backup', 'corrupt too');
+assert.equal(context.TVLink.identity(320), 1);
+assert.equal(storage.has('steam-tv-paired'), false, 'an unrecoverable identity must drop the pairing');
+assert.notDeepEqual(context.Module.HEAPU8.slice(320, 360), first);
+assert.equal(context.TVLink.pin(400), 1);
+assert.match(elements.get('pin').textContent, /^\d{4}$/);
+assert.equal(context.Module.HEAPU8[404], 0);
+context.TVLink.host('192.168.1.9');
+assert.equal(elements.get('pair').disabled, false);
+handlers.get('keydown')({ keyCode: 13, key: 'Enter', preventDefault() {} });
+assert.equal(context.TVLink.command, 1);
+context.TVLink.command = 0;
+context.TVLink.host('192.168.1.9');
+assert.equal(elements.get('pair').disabled, true);
+elements.get('pair').onclick();
+assert.equal(context.TVLink.command, 0);
+context.TVLink.done('retry');
+assert.equal(elements.get('pair').disabled, false);
+assert.equal(context.TVLink.pairing, false);
+elements.get('pair').disabled = true;
+handlers.get('keydown')({ keyCode: 13, key: 'Enter', preventDefault() {} });
+assert.equal(context.TVLink.command, 0);
+let exited = false;
+context.window.tizen = context.tizen = { application: { getCurrentApplication: () => ({ exit() { exited = true; } }) } };
+handlers.get('keydown')({ keyCode: 10009, preventDefault() {} });
+assert.equal(exited, true);
+context.TVLink.playing();
+assert.equal(playingClass, true);
+handlers.get('keydown')({ keyCode: 38, preventDefault() {} });
+handlers.get('keyup')({ keyCode: 38 });
+assert.deepEqual(Array.from(context.TVLink.keys), [1082, 2082]);
+handlers.get('keydown')({ keyCode: 10009, preventDefault() {} });
+assert.equal(context.TVLink.command, 3);
+assert.equal(playingClass, false);
+context.TVLink.starting = false;
+context.TVLink.command = 0;
+storage.set('steam-tv-paired', '1');
+context.TVLink.host('192.168.1.9');
+assert.equal(context.TVLink.command, 0, 'a remembered pairing must not auto-start the stream');
+assert.equal(elements.get('start').disabled, false, 'the start button must wait for a deliberate press');
+elements.get('start').onclick();
+assert.equal(context.TVLink.command, 2, 'pressing start must request the stream');
+assert.equal(elements.get('start').disabled, true);
+assert.equal(elements.get('pair').hidden, true);
+assert.equal(elements.get('pin-row').hidden, true);
+assert.match(elements.get('host').textContent, /Párosítva/);
+context.TVLink.failed('timeout');
+context.TVLink.command = 0;
+assert.equal(context.TVLink.starting, false);
+assert.equal(elements.get('start').disabled, false);
+context.TVLink.host('192.168.1.9');
+assert.equal(context.TVLink.command, 0, 'discovery must not cause a retry loop');
+elements.get('start').onclick();
+assert.equal(context.TVLink.command, 2);
+context.TVLink.failed('unauthorized', true);
+assert.equal(storage.has('steam-tv-paired'), false);
+assert.equal(elements.get('pair').hidden, false);
+assert.equal(elements.get('pair').disabled, false);
+let frameCallback, pictures = 0;
+const video = context.document.getElementById('video');
+video.requestVideoFrameCallback = callback => { frameCallback = callback; };
+video.readyState = 2; video.videoWidth = 1920;
+context.Module._TVPicture = () => pictures++;
+context.TVLink.awaitPicture();
+assert.equal(pictures, 0, 'track readiness must not mean displayed video');
+const staleCallback = frameCallback;
+context.TVLink.failed('cancelled');
+staleCallback();
+assert.equal(pictures, 0, 'late frame callback must not restore a cancelled stream');
+context.TVLink.awaitPicture(); frameCallback();
+assert.equal(pictures, 1);
+assert.equal(context.TVLink.streaming, true);
+let pads = [{ connected: true, mapping: 'standard', index: 3, id: 'Xbox', axes: [-1, 0.5, NaN, 2], buttons: Array.from({length:18}, () => ({ pressed:false, value:0 })) }];
+pads[0].buttons[0].pressed = true; pads[0].buttons[12].pressed = true; pads[0].buttons[6].value = 1;
+context.navigator = { getGamepads: () => pads };
+context.TVLink.readGamepads(600);
+assert.equal(new DataView(context.Module.HEAPU8.buffer).getUint32(760, true), 2,
+  'each published gamepad snapshot must finish with an even sequence');
+const wire = new DataView(context.Module.HEAPU8.buffer);
+assert.equal(wire.getInt16(608, true), -32768);
+assert.equal(wire.getInt16(610, true), 16384);
+assert.equal(wire.getInt16(612, true), 0);
+assert.equal(wire.getInt16(614, true), 32767);
+assert.equal(wire.getInt16(616, true), 32767);
+assert.equal(wire.getUint16(624, true), 1 | (1 << 11));
+assert.equal(wire.getUint8(635), 3);
+const padGeneration = wire.getUint32(600, true);
+pads = [{ ...pads[0], id: 'DualSense 054c' }];
+context.TVLink.readGamepads(600);
+assert.equal(wire.getUint32(604, true), 45);
+assert.notEqual(wire.getUint32(600, true), padGeneration);
+pads = []; context.TVLink.readGamepads(600);
+assert.equal(wire.getUint32(600, true), 0, 'unplug must clear input and identity');
+// A Bluetooth pad that Tizen reports without the standard mapping must still be mapped.
+pads = [{ connected: true, mapping: '', index: 5, id: 'Wireless Controller', axes: [0, 0, 0, 0], buttons: Array.from({ length: 17 }, () => ({ pressed: false, value: 0 })) }];
+context.TVLink.readGamepads(600);
+assert.notEqual(wire.getUint32(600, true), 0, 'a non-standard pad with a standard layout must still be mapped');
+pads = [{ connected: true, mapping: '', index: 6, id: 'Keyboard', axes: [0], buttons: [] }];
+context.TVLink.readGamepads(600);
+assert.equal(wire.getUint32(600, true), 0, 'a device without a controller layout must be ignored');
+pads = [];
+// While streaming the remote must drive the game, never the app buttons.
+context.TVLink.streaming = true;
+context.TVLink.keys.length = 0;
+context.TVLink.command = 0;
+handlers.get('keydown')({ keyCode: 13, key: 'Enter', preventDefault() {} });
+assert.deepEqual(Array.from(context.TVLink.keys), [1040], 'OK must reach the game while streaming');
+assert.equal(context.TVLink.command, 0, 'OK must not activate an app button while streaming');
+context.TVLink.streaming = false;
+context.TVLink.presetIndex = 3; context.TVLink.frameRate = 60; context.TVLink.renderSettings();
+// The on-screen trace is now throttled, so allow the next push to reach the DOM.
+context.TVLink.pushAt = 0;
+context.TVLink.log('Session', 'Send packet: type=1, channel=1');
+assert.match(elements.get('trace').textContent, /Session: Send packet: type=1, channel=1$/, 'the newest log line must be mirrored on screen');
+context.TVLink.pushAt = 0;
+context.TVLink.log('Session', 'UDP parsed: type=2, channel=0');
+context.TVLink.pushAt = 0;
+context.TVLink.log('Control', 'Send control message: ClientHandshake');
+assert.match(elements.get('trace').textContent, /Send packet: type=1, channel=1\s+\|\s+Session: UDP parsed: type=2, channel=0\s+\|\s+Control: Send control message: ClientHandshake/, 'the last three events must stay visible');
+context.TVLink.log('Session', 'retransmit');
+context.TVLink.log('Session', 'retransmit');
+assert.equal(context.TVLink.logs.filter(line => line === 'Session: retransmit').length, 1, 'consecutive duplicates must be collapsed so they cannot push useful lines out of the window');
+assert.equal(context.TVLink.logs[context.TVLink.logs.length - 1], 'Session: retransmit');
+assert.equal(elements.get('resolution').textContent, 'Felbontás: 1920×1080');
+elements.get('fps').onclick();
+assert.equal(context.TVLink.frameRate, 30);
+assert.equal(elements.get('fps').textContent, 'Képfrissítés: 30 FPS');
+elements.get('fps').onclick();
+assert.equal(context.TVLink.frameRate, 60, 'the frame rate toggle must wrap back to 60');
+context.TVLink.presetIndex = 3;
+assert.equal(context.TVLink.presets[3].width, 1920, '1920x1080 must be the largest preset');
+context.TVLink.settings(700);
+assert.equal(wire.getUint32(700, true), 1920);
+assert.equal(wire.getUint32(704, true), 1080);
+assert.equal(wire.getUint32(708, true), 60);
+context.TVLink.presetIndex = 0; context.TVLink.renderSettings();
+assert.equal(elements.get('resolution').textContent, 'Felbontás: 1024×576', 'the smallest preset must be 1024 wide');
+context.TVLink.presetIndex = context.TVLink.presets.length - 1;
+elements.get('resolution').onclick();
+assert.equal(context.TVLink.presetIndex, 0, 'the resolution cycle must wrap back to the smallest');
+assert.equal(elements.get('resolution').textContent, 'Felbontás: 1024×576');
+assert.equal(storage.get('steam-tv-resolution'), '0', 'the chosen resolution must be persisted');
+assert.equal(storage.get('steam-tv-fps'), '60', 'the chosen frame rate must be persisted');
+storage.set('steam-tv-fps', '30'); storage.set('steam-tv-resolution', '3');
+context.TVLink.frameRate = 60; context.TVLink.presetIndex = 0;
+context.TVLink.loadSettings();
+assert.equal(context.TVLink.frameRate, 30, 'the stored frame rate must survive a restart');
+assert.equal(context.TVLink.presetIndex, 3, 'the stored resolution must survive a restart');
+storage.set('steam-tv-fps', 'bogus'); storage.set('steam-tv-resolution', '99');
+context.TVLink.frameRate = 60; context.TVLink.presetIndex = 3;
+context.TVLink.loadSettings();
+assert.equal(context.TVLink.frameRate, 60, 'invalid stored frame rates must fall back');
+assert.equal(context.TVLink.presetIndex, 3, 'out-of-range stored presets must fall back');
+context.TVLink.streaming = true;
+elements.get('fps').onclick(); elements.get('resolution').onclick();
+assert.equal(context.TVLink.frameRate, 60, 'settings must be locked while streaming');
+assert.equal(context.TVLink.presetIndex, 3, 'settings must be locked while streaming');
+context.TVLink.streaming = false;
+// Simulate a restart: a fresh app instance over the same persisted storage must reuse the stored
+// identity and remember the pairing instead of asking for a PIN again.
+storage.set('steam-tv-paired', '1');
+const restartElements = new Map(), restartHandlers = new Map();
+const restart = vm.createContext({ document: { getElementById: id => {
+  if (!restartElements.has(id)) restartElements.set(id, { textContent: '', disabled: true, hidden: false, focus() {} });
+  return restartElements.get(id);
+}, body: { classList: { add() {}, remove() {} } }, addEventListener(name, handler) { restartHandlers.set(name, handler); } }, crypto: webcrypto, console, window: {}, localStorage: {
+  getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key)
+}, Uint8Array, Uint32Array });
+vm.runInContext(await readFile(new URL('./app.js', import.meta.url), 'utf8'), restart);
+restart.Module.HEAPU8 = new Uint8Array(1024);
+const stored = storage.get('steam-tv-identity');
+const storedIdentity = new Uint8Array(stored.match(/../g).map(value => parseInt(value, 16)));
+assert.equal(restart.TVLink.identity(100), 1);
+assert.deepEqual(restart.Module.HEAPU8.slice(100, 140), storedIdentity, 'a restart must reuse the stored identity');
+restart.TVLink.host('192.168.1.9');
+assert.match(restartElements.get('host').textContent, /Párosítva/, 'a restart must remember the pairing');
+assert.equal(restartElements.get('pair').hidden, true, 'the pairing button must stay hidden after a restart');
+assert.equal(restartElements.get('start').disabled, false);
+assert.equal(restart.TVLink.command, 0, 'a remembered pairing must not auto-start the stream after a restart');
+restartElements.get('start').onclick();
+assert.equal(restart.TVLink.command, 2, 'pressing start after a restart must request the stream');
+assert.equal(restart.TVLink.presetIndex, 3, 'the stored resolution must be reused after a restart');
+assert.equal(restart.TVLink.frameRate, 60, 'the stored frame rate must be reused after a restart');
+// The phase suffix must track the live phase, not the phase at the time the text was written.
+context.Module._TVStage = () => 11;
+context.TVLink.status('teszt');
+assert.equal(elements.get('status').textContent, 'teszt [fázis 11]');
+context.Module._TVStage = () => 12;
+context.TVLink.pushAt = 0;
+context.TVLink.log('Session', 'x');
+assert.match(elements.get('status').textContent, /\[fázis 12\]$/, 'the phase suffix must refresh as the phase advances');
+// Discovery reports arrive every few seconds. Only the first one may move the cursor, otherwise the
+// resolution/FrameRate buttons lose the focus while they are being used.
+storage.set('steam-tv-paired', '1');
+context.TVLink.hasHost = false; context.TVLink.starting = false; context.TVLink.streaming = false;
+focused.current = null;
+context.TVLink.host('192.168.1.9');
+assert.equal(focused.current.id, 'start', 'the first discovery focuses the start button');
+elements.get('resolution').focus();
+context.TVLink.host('192.168.1.9');
+assert.equal(focused.current.id, 'resolution', 'a repeated discovery must not steal the focus');
+context.TVLink.host('192.168.1.9');
+assert.equal(focused.current.id, 'resolution', 'repeated discoveries keep their hands off the focus');
+// A controller must drive the very same focus ring as the remote control.
+function padWith(buttons, axes) {
+  return { connected: true, index: 0, id: 'Xbox Wireless Controller', mapping: 'standard',
+    buttons: Array.from({ length: 17 }, (unused, index) => ({ pressed: buttons.includes(index) })),
+    axes: axes || [0, 0, 0, 0] };
+}
+context.navigator = { getGamepads: () => [padWith([13])] };
+context.TVLink.padKey = 0;
+elements.get('fps').disabled = false;
+elements.get('resolution').disabled = false;
+elements.get('resolution').focus();
+context.TVLink.pollGamepadUi();
+assert.equal(focused.current.id, 'fps', 'the D-pad down button must move the focus forward');
+// Up/left must walk the list backwards: both directions used to move forward.
+context.TVLink.padKey = 0;
+context.navigator = { getGamepads: () => [padWith([12])] };
+context.TVLink.pollGamepadUi();
+assert.equal(focused.current.id, 'resolution', 'the D-pad up button must move the focus backwards');
+context.navigator = { getGamepads: () => [padWith([14])] };
+context.TVLink.padKey = 0;
+context.TVLink.pollGamepadUi();
+assert.equal(focused.current.id, 'start', 'the D-pad left button must wrap backwards');
+context.TVLink.padKey = 0;
+context.TVLink.padKeyAt = 0;
+elements.get('resolution').focus();
+context.navigator = { getGamepads: () => [padWith([0])] };
+const presetBefore = context.TVLink.presetIndex;
+context.TVLink.pollGamepadUi();
+assert.equal(context.TVLink.presetIndex, (presetBefore + 1) % context.TVLink.presets.length,
+  'the A button must press the focused settings button');
+context.navigator = { getGamepads: () => [padWith([], [1, 0, 0, 0])] };
+context.TVLink.padKey = 0;
+context.TVLink.pollGamepadUi();
+assert.equal(focused.current.id, 'fps', 'the left stick must move the focus as well');
+const focusBeforeStreaming = focused.current.id;
+context.TVLink.streaming = true;
+context.TVLink.padKey = 0;
+context.TVLink.keys.length = 0;
+context.navigator = { getGamepads: () => [padWith([12, 0])] };
+context.TVLink.pollGamepadUi();
+assert.equal(context.TVLink.keys.length, 0, 'while streaming the pad belongs to the game');
+assert.equal(focused.current.id, focusBeforeStreaming, 'while streaming the pad must not move the app focus');
+context.TVLink.streaming = false;
+// The watchdog is the only reporter left when the C threads are wedged by a stalled media pipeline,
+// so its byte-level writing into WASM memory must not depend on the state it is reporting.
+const clock = 400;
+const logBuffer = 700;
+context.Module._TVVideoClockBuffer = () => clock;
+context.Module._TVLogBuffer = () => logBuffer;
+context.Module._TVLogFlush = () => { context.TVLink.flushed = new TextDecoder().decode(context.Module.HEAPU8.slice(logBuffer, context.Module.HEAPU8.indexOf(0, logBuffer))); };
+const clockView = new DataView(context.Module.HEAPU8.buffer);
+clockView.setUint32(clock + 20, 1234, true);
+clockView.setUint32(clock + 24, 60, true);
+clockView.setUint32(clock + 28, 2, true);
+clockView.setUint32(clock + 32, 50, true);
+clockView.setUint32(clock + 36, 3, true);
+clockView.setUint32(clock + 40, 1, true);
+clockView.setUint32(clock + 44, 7, true);
+clockView.setUint32(clock + 48, 1500, true);
+context.Module.HEAPU8.fill(0, logBuffer, logBuffer + 300);
+elements.get('video').readyState = 4;
+elements.get('video').paused = true;
+elements.get('video').videoWidth = 1920;
+elements.get('video').videoHeight = 1080;
+let played = 0;
+elements.get('video').play = () => { played++; return { catch() {} }; };
+context.TVLink.streaming = true;
+context.TVLink.watchdog();
+assert.match(context.TVLink.flushed, /fazis 12, fociklus 1234, kocka 60\/2, hang 50\/hiba 3\/vissza 1, PTS 1\.5 s, eldobott koldes 7, pad \d+db\/max \d+ms, video 4\/all\/1920x1080/,
+  'the watchdog must report the shared counters verbatim');
+assert.equal(played, 1, 'a paused element during a stream must be nudged to play again');
+context.TVLink.watchdog();
+assert.match(context.TVLink.flushed, /fociklus 1234 ALL/, 'a loop tick count that does not move is a stall');
+context.TVLink.watchdog();
+context.TVLink.watchdog();
+assert.match(elements.get('status').textContent, /lefagyott/, 'a stall must be shown on screen');
+const backHandler = handlers.get('keydown');
+context.window.tizen = { application: { getCurrentApplication: () => ({ exit: () => { context.TVLink.exited = true; } }) } };
+backHandler({ keyCode: 10009, key: 'Back', preventDefault() {} });
+assert.equal(context.TVLink.exited, true, 'with a stalled main loop the Back key must leave the app');
+context.TVLink.streaming = false;
+delete context.window.tizen;
+context.TVLink.hasHost = true;
+context.TVLink.command = 0;
+context.TVLink.beginStopping('Leállítás…');
+assert.equal(context.TVLink.stopping, true);
+assert.equal(elements.get('start').disabled, true);
+assert.equal(elements.get('pair').disabled, true);
+elements.get('start').onclick(); elements.get('pair').onclick();
+context.TVLink.host('192.168.1.9');
+context.TVLink.done('late pairing callback');
+context.TVLink.failed('late failure callback');
+context.TVLink.playing();
+assert.equal(context.TVLink.command, 0, 'cleanup must block requests even after discovery and late callbacks');
+assert.equal(elements.get('start').disabled, true);
+assert.equal(elements.get('pair').disabled, true);
+assert.equal(context.TVLink.streaming, false);
+let cleanupExits = 0;
+context.window.tizen = { application: { getCurrentApplication: () => ({ exit() { cleanupExits++; } }) } };
+context.TVLink.uiKey(10009);
+assert.equal(cleanupExits, 1, 'Back must exit directly when cleanup cannot complete');
+context.TVLink.endStopping('Leállítva.');
+assert.equal(context.TVLink.stopping, false);
+assert.equal(elements.get('start').disabled, false);
+const playedAfterCleanup = played;
+context.TVLink.watchdog(); context.TVLink.watchdog(); context.TVLink.watchdog();
+assert.equal(context.Module._TVStage(), 12, 'simulate the stale native phase after teardown');
+assert.equal(played, playedAfterCleanup, 'watchdog must not replay a closed video element');
+assert.equal(context.TVLink.streaming, false);
+assert.equal(bodyClasses.has('playing'), false, 'the menu must remain visible after cleanup');
+elements.get('start').onclick();
+assert.equal(context.TVLink.command, 2, 'retry becomes available only after cleanup completion');
+
+/* Every button in the panel must be reachable with the TV remote. moveFocus() only moves inside
+ * focusables(), so a button missing from that list cannot be pressed from the couch at all - measured
+ * 2026-10-15: the "Késleltetés (teszt)" A/B button was unreachable, which is why the latency-mode run
+ * never happened. This is the guard for that class of bug. */
+const htmlButtonIds = [...realHtml.matchAll(/<button id="([^"]+)"/g)].map((match) => match[1]);
+assert.ok(htmlButtonIds.length >= 8, `expected the panel buttons in index.html, found ${htmlButtonIds.length}`);
+/* disabled/hidden are set at runtime on purpose (the pairing button disappears once paired), so this
+ * checks ring membership: is the button part of focusables() at all? */
+for (const id of htmlButtonIds) { const element = context.document.getElementById(id); element.disabled = false; element.hidden = false; }
+const reachable = new Set(context.TVLink.focusables().map((item) => item.id));
+for (const id of htmlButtonIds) {
+  assert.ok(reachable.has(id), `button '${id}' exists in index.html but the remote focus ring cannot reach it`);
+}
+assert.ok(reachable.has('latency'), 'the latency A/B button must stay reachable');
+
+console.log('Pairing recovery, retry, first-frame cancellation, remote controls, gamepad mapping, stream settings, pairing persistence and asynchronous cleanup UI passed.');

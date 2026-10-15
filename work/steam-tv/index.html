@@ -1,0 +1,44 @@
+<!doctype html><html lang="hu"><head><meta charset="utf-8"><title>Steam TV</title><style>
+body{font:26px/1.55 system-ui,sans-serif;background:radial-gradient(circle at 18% -10%,#1e2c3d,#0a0e13 65%);color:#fff;padding:56px 64px;margin:0}
+h1{font-size:46px;margin:0 0 4px;letter-spacing:.5px}
+h2{font-size:20px;margin:26px 0 4px;opacity:.6;font-weight:600;text-transform:uppercase;letter-spacing:1.5px}
+.card{background:#ffffff0f;border:1px solid #ffffff1f;border-radius:22px;padding:26px 30px;max-width:1080px;box-shadow:0 18px 50px #0008}
+button{font:inherit;padding:15px 22px;margin:8px 14px 8px 0;background:linear-gradient(#8fe0c8,#57bfa3);color:#07131a;border:0;border-radius:14px;font-weight:650;box-shadow:0 4px 0 #2c7a64;transition:transform .08s}
+button:focus{outline:4px solid #fff;transform:translateY(-2px)}
+button:disabled{opacity:.32;box-shadow:none;transform:none}
+button.primary{background:linear-gradient(#ffd479,#f0a92e);box-shadow:0 4px 0 #a86f10}
+#pin{font:54px monospace;letter-spacing:8px}
+#video{display:none;position:fixed;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+.preparing #video,.playing #video{display:block}
+.preparing #panel,.playing #panel{position:fixed;left:24px;top:16px;font-size:20px;background:#000a;border-radius:14px;padding:10px 18px;border:1px solid #ffffff22}
+.preparing #panel>:not(#status),.playing #panel>:not(#status){display:none}
+.playing.quiet #panel{display:none}
+#status{font-weight:650}
+#trace{font-size:13px;line-height:1.35;opacity:.65;word-break:break-word}
+#performance{display:none;position:fixed;bottom:16px;left:24px;right:24px;padding:12px;background:#000c;color:#fff;font:16px/1.4 monospace;white-space:pre-wrap;pointer-events:none}
+.playing.diagnostics #performance{display:block}
+</style></head><body>
+<video id="video" autoplay playsinline></video>
+<div id="panel"><p id="status" role="status">WASM modul betöltése…</p><div class="card">
+<h1>Steam TV</h1>
+<p id="host">PC keresése…</p>
+<h2>Kapcsolat</h2>
+<button id="pair" disabled>Párosítás a Steammel</button>
+<button id="start" class="primary" disabled>Big Picture indítása</button>
+<h2>Kép és hang</h2>
+<button id="resolution">Felbontás: 1920×1080</button>
+<button id="fps">Képfrissítés: 60 FPS</button>
+<button id="bitrate">Bitráta: Automatikus</button>
+<button id="codec">Kodek: Automatikus</button>
+<button id="audio">Hang: be</button>
+<button id="diagnostics">Diagnosztika: ki</button>
+<h2>Teszt (A/B méréshez)</h2>
+<button id="latency">Késleltetés (teszt): Automatikus</button>
+<p id="pin-row">Steam PIN: <strong id="pin">—</strong></p>
+<p id="crypto"></p>
+<p id="trace"></p>
+<p id="version" style="opacity:.75;font-weight:650">Steam TV</p>
+<p style="opacity:.6">A tévé távirányítójával vagy a tévéhez csatlakoztatott kontrollerrel (D-pad, A, B) állíthatod a beállításokat; stream közben a Vissza gomb állítja le a képet.</p>
+</div></div>
+<pre id="performance" aria-live="off"></pre>
+<script src="app.js"></script><script src="ihs.js"></script></body></html>

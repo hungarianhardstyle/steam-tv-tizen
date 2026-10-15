@@ -1,0 +1,190 @@
+/*
+ *  _____  _   _  _____  _  _  _
+ * |_   _|| | | |/  ___|| |(_)| |     Steam
+ *   | |  | |_| |\ `--. | | _ | |__     In-Home
+ *   | |  |  _  | `--. \| || || '_ \      Streaming
+ *  _| |_ | | | |/\__/ /| || || |_) |       Library
+ *  \___/ \_| |_/\____/ |_||_||_.__/
+ *
+ * Copyright (c) 2022 Mariotaku <https://github.com/mariotaku>.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 3 of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ *
+ */
+
+#pragma once
+
+#include "base.h"
+#include "clock.h"
+#include "ihslib/session.h"
+#include "packet.h"
+#include "retransmission.h"
+#include <stdatomic.h>
+
+#include "channels/channel.h"
+
+#include "ihs_queue.h"
+#include "protobuf/remoteplay.pb-c.h"
+
+/**
+ * Connection phase. Advances monotonically from Unconnected to Connected; never goes
+ * backwards within a single session lifetime (a re-connect requires a fresh session).
+ * Guards on the message-handling entry points use this to drop stale or replayed
+ * packets that would otherwise re-trigger an earlier phase.
+ *
+ *   Unconnected   - IHS_SessionCreate just returned, no Connect packet sent yet.
+ *   Connecting    - Connect packet sent on the discovery channel, waiting for ACK.
+ *   Handshaking   - ConnectACK received, ClientHandshake sent, waiting for ServerHandshake.
+ *   Authenticating- ServerHandshake received, AuthenticationRequest sent, waiting for response.
+ *   Negotiating   - AuthenticationResponse = Succeeded, waiting for NegotiationInit / sending
+ * SetConfig. Connected     - NegotiationComplete sent, the stream is live.
+ */
+typedef enum IHS_SessionConnectionState {
+    IHS_SessionConnectionStateUnconnected,
+    IHS_SessionConnectionStateConnecting,
+    IHS_SessionConnectionStateHandshaking,
+    IHS_SessionConnectionStateAuthenticating,
+    IHS_SessionConnectionStateNegotiating,
+    IHS_SessionConnectionStateConnected,
+} IHS_SessionConnectionState;
+
+typedef struct IHS_SessionState {
+    IHS_SessionConnectionState connectionState;
+    int mtu;
+    uint8_t connectionId;
+    uint8_t hostConnectionId;
+    /**
+     * Negotiated stream-enable flags from CSetStreamingClientConfig. Default true at
+     * session creation since the streaming request asked for all three; the server
+     * confirms (or vetoes) via OnSetClientConfig. Mirrors Steam's BStreamingInput /
+     * BStreamingAudio / BStreamingVideo accessors reading from
+     * clientConfig.enable_*_streaming.
+     */
+    atomic_bool streamingInput;
+    bool streamingAudio;
+    bool streamingVideo;
+    /* Host notification for UI/diagnostics; not an outbound HID gate. */
+    atomic_bool inputTemporarilyDisabled;
+} IHS_SessionState;
+
+struct IHS_FrameStatsAggregator;
+
+struct IHS_Session {
+    IHS_Base base;
+    IHS_SessionInfo info;
+    IHS_SessionState state;
+    /* Negotiated codec preference and capture size; StartVideoData supplies
+     * the actual decoder configuration. */
+    int negotiatedVideoCodec;
+    uint32_t captureWidth, captureHeight;
+    /* Sender timestamp (1/65536 s units, see packet.h) of the video frame the submit callback is
+     * currently being handed. The decoder callback has no timestamp parameter, and building a video
+     * timeline by adding a fixed 1/fps per delivered frame drifts away from real time whenever the
+     * host delivers fewer frames than the target rate - which desynchronises it from the audio
+     * timeline in a low-latency source where the application owns synchronisation. */
+    uint32_t lastVideoFrameTimestamp;
+    uint32_t lastVideoFrameReadyTimestamp;
+    /* Local receive clock (1/65536 s) when the first fragment of the frame currently being assembled
+     * arrived. IHS_SessionVideoFrameReadyTimestamp minus this is how long the frame took to complete,
+     * which is what "the picture stutters" looks like on the receive side. */
+    uint32_t lastVideoAssemblyStartTimestamp;
+    /* Local receive clock (1/65536 s) of the previously completed frame, for the arrival-interval
+     * measurement, and whether the frame currently being assembled started with a keyframe. */
+    uint32_t metricsLastSubmitTs;
+    bool lastVideoFrameWasKey;
+    /* Host-timestamp bookkeeping for the host-pacing measurement (metrics.videoHostInterval*). */
+    uint32_t metricsLastHostTs;
+    bool metricsHaveHostTs;
+    /* Audio arrival pacing bookkeeping (metrics.audioArrival* / audioHostInterval*). */
+    uint32_t metricsLastAudioArrivalTs;
+    uint32_t metricsLastAudioHostTs;
+    bool metricsHaveAudioArrival;
+    uint32_t lastAudioFrameTimestamp;
+    uint16_t lastAudioFrameGap;
+    atomic_bool destroying;
+    atomic_bool hostVideoStopped;
+    atomic_bool hostRequestedStop; /* Explicit inbound StopRequest / Disconnect only. */
+    uint8_t numChannels;
+    IHS_SessionChannel *channels[16];
+    IHS_Thread *sendThread;
+    IHS_Cond *sendQueueCond;
+    IHS_Mutex *sendQueueMutex;
+    IHS_Queue *sendQueue;
+    IHS_Queue *pendingData; /* RX-thread-owned packets awaiting Start*Data metadata */
+    unsigned pendingDataCount;
+    IHS_Timer *timers;
+    IHS_SessionRetransmission retransmission;
+    IHS_StreamClock clock;
+    IHS_HIDManager *hidManager;
+    struct IHS_FrameStatsAggregator *frameStats;
+    struct IHS_FrameTracker *frameTracker;
+    uint64_t videoTrackingId, nextVideoEpoch;
+    bool invalidVideoCallbacks;
+    IHS_StreamClientCapabilities clientCapabilities; /* session-owned strings */
+    struct {
+        const IHS_StreamSessionCallbacks *session;
+        const IHS_StreamAudioCallbacks *audio;
+        const IHS_StreamVideoCallbacks *video;
+        const IHS_StreamInputCallbacks *input;
+        const IHS_StreamMicrophoneCallbacks *microphone;
+    } callbacks;
+    struct {
+        void *session;
+        void *audio;
+        void *video;
+        void *input;
+        void *microphone;
+    } callbackContexts;
+    /* Measurement counters (IHS_SessionStreamMetrics, public header). Purely diagnostic: nothing in
+     * the control flow reads them, so a wrong or stale value can never change the stream's behaviour.
+     * Written by the data-channel workers (one writer per counter) and read once per second by
+     * IHS_SessionGetStreamMetrics from the decoder callback. */
+    IHS_SessionStreamMetrics metrics;
+};
+
+#define IHS_SessionLog(session, level, tag, ...)                                                   \
+    IHS_BaseLog((IHS_Base *)(session), (level), (tag), __VA_ARGS__)
+
+void IHS_SessionInterrupt(IHS_Session *session);
+
+bool IHS_SessionSendPacket(IHS_Session *session, IHS_SessionPacket *packet);
+
+/**
+ * Add packet to send queue
+ * @param session Session instance
+ * @param packet Packet
+ * @param retransmit If true, retain and retry the packet until its exact ACK arrives
+ * @return
+ */
+bool IHS_SessionQueuePacket(IHS_Session *session, IHS_SessionPacket *packet, bool retransmit);
+
+bool IHS_SessionSendControlMessage(IHS_Session *session, EStreamControlMessage type,
+                                   const ProtobufCMessage *message);
+
+/**
+ * @return true if the session-state input flag is set. Outbound input/HID send sites should
+ *   early-return false when this is false. Mirrors Steam's BStreamingInput().
+ */
+bool IHS_SessionInputEnabled(IHS_Session *session);
+
+/**
+ * Mirrors Steam's IsStreaming(): true once NegotiationComplete has been sent.
+ * Outbound control traffic that the host only expects from a live session must
+ * check this — it accepts an early packet, then abandons the session.
+ */
+bool IHS_SessionStreaming(IHS_Session *session);
+
+void IHS_SessionHostStopped(IHS_Session *session);
+
+void IHS_SessionDrainPendingData(IHS_Session *session, IHS_SessionChannel *channel);
