@@ -9,7 +9,12 @@ using TizenSdb.SigningManager;
 using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
 var work = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../.."));
 SdbTcpDevice.KeyDirectory = Path.Combine(work, "sdb-key");
-await using var device = new SdbTcpDevice(IPAddress.Parse("192.168.1.6"));
+// The TV address is not a property of this project: take it from the first argument or the TV_IP
+// environment variable, and only fall back to the author's own TV so an existing setup keeps working.
+var tvIp = args.FirstOrDefault((arg) => IPAddress.TryParse(arg, out _))
+           ?? Environment.GetEnvironmentVariable("TV_IP")
+           ?? "192.168.1.6";
+await using var device = new SdbTcpDevice(IPAddress.Parse(tvIp));
 await device.ConnectAsync(timeout.Token);
 Console.WriteLine($"SDB: {device.DeviceId}");
 var capabilities = await device.CapabilityAsync(timeout.Token);

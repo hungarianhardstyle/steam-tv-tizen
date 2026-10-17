@@ -100,7 +100,7 @@ EMSCRIPTEN_KEEPALIVE void TVPicture(void) { atomic_store(&picture_ready, true); 
 /* Single source of truth for the build version: the app shows it (app.js asks for it with
  * Module._TVVersion()), every measurement line carries it (MET/SUMMARY/RUN), so a log can always be
  * tied to the exact build that produced it. Bump it with every installed build. */
-#define TV_BUILD_VERSION "1.4.3"
+#define TV_BUILD_VERSION "1.4.4"
 EMSCRIPTEN_KEEPALIVE const char *TVVersion(void) { return TV_BUILD_VERSION; }
 /* A/B test switch for the latency mode; 0 keeps the automatic behaviour. See media.cpp's LatencyMode. */
 int TVLatencyOverride(void) { return (int) latency_override; }
@@ -282,15 +282,19 @@ static void diagnostic_socket_init(void) {
 }
 
 static void diagnostic_send(const char *line) {
-    if (diagnostic_socket < 0) return;
+    if (diagnostic_socket < 0 || target_lock == NULL) return;
     struct sockaddr_in to;
-    uint8_t *ip;
     memset(&to, 0, sizeof(to));
     to.sin_family = AF_INET;
-    /* Network byte order written literally: 192.168.1.9:9999, the streaming PC. */
+    /* The UDP mirror follows the host that was actually discovered rather than a compile-time address:
+     * the literal used to send this log to the author's PC on every network, and to nobody when that
+     * address did not exist. Port 9999 in network byte order, written literally. */
     to.sin_port = (uint16_t) (((DIAGNOSTIC_LOG_PORT & 0xFF) << 8) | (DIAGNOSTIC_LOG_PORT >> 8));
-    ip = (uint8_t *) &to.sin_addr.s_addr;
-    ip[0] = 192; ip[1] = 168; ip[2] = 1; ip[3] = 9;
+    IHS_MutexLock(target_lock);
+    int have_target = found && target.address.ip.family == IHS_IPAddressFamilyIPv4;
+    if (have_target) memcpy(&to.sin_addr, target.address.ip.v4.data, sizeof(to.sin_addr));
+    IHS_MutexUnlock(target_lock);
+    if (!have_target) return;
     sendto(diagnostic_socket, line, strlen(line), 0, (struct sockaddr *) &to, sizeof(to));
 }
 
@@ -567,11 +571,21 @@ static void event(const char *message) {
 
 static void discovered(IHS_Client *client, const IHS_HostInfo *host, void *context) {
     char *ip = IHS_IPAddressToString(&host->address.ip);
-    if (strcmp(ip, "192.168.1.9") == 0) {
-        IHS_MutexLock(target_lock);
-        target = *host;
-        found = 1;
-        IHS_MutexUnlock(target_lock);
+    /* Any Steam host that advertises itself on the network is usable. This used to be pinned to one
+     * address with strcmp(), so the app could only ever find that single machine and every other
+     * network sat at "searching…" forever. The first host that answers is kept: discovery repeats
+     * every few seconds and a second PC on the same LAN must not steal a session that is already
+     * pairing or streaming. */
+    int take = 0;
+    IHS_MutexLock(target_lock);
+    if (!found) { target = *host; found = 1; take = 1; }
+    IHS_MutexUnlock(target_lock);
+    if (take) {
+        char text[160];
+        /* push_diagnostic, not the JavaScript status: this runs on the library's discovery thread, and
+         * a synchronous proxy call from a library thread does not return on this TV. */
+        snprintf(text, sizeof(text), "Steam PC: %s (%s), jatek fut=%d", host->hostname[0] ? host->hostname : "?", ip, host->gamesRunning ? 1 : 0);
+        push_diagnostic("Discovery", text);
         MAIN_THREAD_EM_ASM({ TVLink.host(UTF8ToString($0)); }, ip);
     }
     free(ip);
@@ -641,7 +655,7 @@ int main(void) {
     IHS_ClientSetAuthorizationCallbacks(client, &authorization, identity);
     IHS_ClientSetStreamingCallbacks(client, &streaming, NULL);
     if (!IHS_ClientStartDiscovery(client, 3000)) { event("A Steam felderítése nem indult el."); return 1; }
-    event("Steam keresése: 192.168.1.9. A PC-n legyen engedélyezve a Remote Play.");
+    event("Steam keresése a hálózaton… A PC-n legyen bekapcsolva a Remote Play.");
     for (;;) {
         /* Heartbeat the JavaScript watchdog reads: if this stops while the picture is supposed to be
          * flowing, the main loop (or a lock it takes) is the thing that is stuck. */

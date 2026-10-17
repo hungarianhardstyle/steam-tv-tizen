@@ -24,3 +24,6 @@ work/SteamTV-before-*.wgt
 work/SteamTVProbe.wgt
 .DS_Store
 Thumbs.db
+
+# release packages are attached to GitHub Releases, not committed
+outputs/*.wgt

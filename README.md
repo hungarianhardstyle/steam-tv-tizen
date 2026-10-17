@@ -19,15 +19,19 @@ Steam's own Remote Play.
 Grab `outputs/SteamTV.wgt` and install it with any Tizen sideloader. The easiest is
 [Apps2Samsung](https://github.com/Apps2Samsung/Apps2Samsung/releases/latest) (Windows/macOS/Linux/Android),
 which has a **Custom WGT File** option and handles the signing that Tizen 7+ requires.
+Release packages are distributed **unsigned** (no personal certificate is embedded), so they are signed
+during installation — Apps2Samsung does that for you; on Tizen 5.5–6.5 the Tizen Studio route below
+signs them with your own certificate.
 
 1. **Developer mode on the TV:** `Apps → App Settings →` press `1 2 3 4 5` on the remote (use the `123`
    key if there is no number pad) `→ Developer mode ON →` enter your **PC's LAN IP** in *Host PC IP*
    `→ OK`. Then power-cycle the TV (hold power ≥ 5 s) — the `DEVELOP MODE` tag appears in the Apps panel.
 2. In Apps2Samsung: `Settings → Certificate: Jelly2Sams`, `Local IP: your adapter`, then
-   `Release → Custom WGT File → outputs/SteamTV.wgt → Download & Install`.
+   `Release → Custom WGT File → the downloaded .wgt → Download & Install`.
    (On Tizen 7+ you will be asked to sign in with a Samsung account to sign the package.)
-3. On the TV: launch **Steam TV**, press *Párosítás a Steammel* (Pair with Steam) and enter the PIN
-   shown on the PC, then *Big Picture indítása* (Start Big Picture).
+3. On the TV: launch **Steam TV** — it finds the Steam PC on the network by itself — press
+   *Párosítás a Steammel* (Pair with Steam) and enter the PIN shown on the PC, then *Big Picture indítása*
+   (Start Big Picture).
 
 Alternative: import the `.wgt` into Tizen Studio, create an author + distributor certificate profile
 (TV DUID), and use *Run As → Tizen Web Application*.
@@ -59,21 +63,23 @@ bundle with the Samsung TV extensions), .NET 8 for the installer.
    node work\test-metrics.mjs         # measurement + log-parsing contract tests
    powershell -ExecutionPolicy Bypass -File work\test-native.ps1   # native WASM library tests
    ```
-4. Install to the TV:
+4. Install to the TV (the TV address is an argument or the `TV_IP` environment variable — the built-in
+   default is the author's own TV):
    ```powershell
-   dotnet run --project work\tv-device -- install-probe
+   dotnet run --project work\tv-device -- install-probe 192.168.1.6
    ```
 
-### ⚠️ Configure these two addresses first
+### Host discovery — no address in the code
 
-The addresses of the author's own machines are still in the source — change them for your network:
+The Steam PC is **not configured anywhere**: the client uses Steam's own discovery protocol
+(`IHS_ClientStartDiscovery`, a UDP broadcast that the running Steam client answers) and takes the first
+host that replies; its IP and hostname are logged (`Discovery: Steam PC: <hostname> (<ip>)`) and the
+address is shown on the TV. Nothing has to match your network, and a PC that starts Steam *after* the app
+is still found, because discovery repeats every 3 s.
 
-| Where | What | Note |
-| --- | --- | --- |
-| `work/steam-tv/probe.c` (3 places) | the streaming **PC** address (`192.168.1.9`) | the client looks for the host at this address |
-| `work/tv-device/Program.cs` (line 12) | the **TV** address (`192.168.1.6`) | used by the sideload installer |
-
-Making the PC address a UI setting instead of a compile-time constant would be a welcome contribution.
+Known limitation: on a LAN with **several** Steam PCs the first one that answers wins and is not
+replaced (so that a second PC cannot steal a session that is already pairing or streaming). Picking a
+host from a list would be a welcome contribution.
 
 ### Layout
 
